@@ -15,46 +15,105 @@ if (typeof window === 'undefined') {
   pdfjsLib.GlobalWorkerOptions.workerSrc = pdfjsWorker;
 }
 
-// Function to extract text from PDF using GPT-4o Vision
-async function extractPDFTextWithVision(buffer: Buffer, openaiClient: OpenAI): Promise<string> {
+// Function to find pages containing criteria keywords (fast OCR-like scan)
+async function findCriteriaPages(pdf: any, maxPages: number = 50): Promise<number[]> {
+  const criteriaPages: Set<number> = new Set();
+  const keywords = ['inclusion criteria', 'exclusion criteria', 'eligibility criteria', 'inclusion', 'exclusion'];
+
+  console.log('Scanning for criteria pages...');
+
+  // Quick scan of all pages in parallel batches
+  const batchSize = 20;
+  for (let start = 1; start <= maxPages; start += batchSize) {
+    const end = Math.min(start + batchSize - 1, maxPages);
+    const batchPromises = [];
+
+    for (let pageNum = start; pageNum <= end; pageNum++) {
+      batchPromises.push(
+        pdf.getPage(pageNum)
+          .then((page: any) => page.getTextContent())
+          .then((content: any) => {
+            const text = content.items.map((item: any) => item.str).join(' ').toLowerCase();
+            const hasKeyword = keywords.some(keyword => text.includes(keyword));
+            return { pageNum, hasKeyword, text };
+          })
+          .catch(() => ({ pageNum, hasKeyword: false, text: '' }))
+      );
+    }
+
+    const results = await Promise.all(batchPromises);
+    results.forEach(result => {
+      if (result.hasKeyword) {
+        // Add this page and surrounding pages (criteria often span multiple pages)
+        criteriaPages.add(result.pageNum);
+        if (result.pageNum > 1) criteriaPages.add(result.pageNum - 1);
+        if (result.pageNum < maxPages) criteriaPages.add(result.pageNum + 1);
+      }
+    });
+
+    // Early exit if we found criteria pages
+    if (criteriaPages.size > 0) {
+      console.log(`Found criteria keywords on pages: ${Array.from(criteriaPages).sort((a, b) => a - b).join(', ')}`);
+      break;
+    }
+  }
+
+  return Array.from(criteriaPages).sort((a, b) => a - b);
+}
+
+// Optimized function to extract text from specific PDF pages using GPT-4o Vision
+async function extractPDFTextWithVision(buffer: Buffer, openaiClient: OpenAI, targetPages?: number[]): Promise<string> {
   try {
-    console.log('Starting GPT-4o Vision extraction...');
+    console.log('Starting optimized GPT-4o Vision extraction...');
 
     // Load the PDF
     const data = new Uint8Array(buffer);
     const pdf = await pdfjsLib.getDocument({ data }).promise;
     console.log(`PDF has ${pdf.numPages} pages`);
 
-    // Process pages (limit to first 10 pages to save costs and time)
-    const maxPages = Math.min(pdf.numPages, 10);
-    const imagePromises = [];
+    // If no target pages specified, find them first
+    let pagesToProcess = targetPages;
+    if (!pagesToProcess || pagesToProcess.length === 0) {
+      pagesToProcess = await findCriteriaPages(pdf, Math.min(pdf.numPages, 50));
 
-    for (let pageNum = 1; pageNum <= maxPages; pageNum++) {
+      // If still no pages found, fall back to first 5 pages
+      if (pagesToProcess.length === 0) {
+        console.log('No criteria pages found, processing first 5 pages');
+        pagesToProcess = Array.from({ length: Math.min(5, pdf.numPages) }, (_, i) => i + 1);
+      }
+    }
+
+    // Limit to max 8 pages to keep it fast
+    pagesToProcess = pagesToProcess.slice(0, 8);
+    console.log(`Processing ${pagesToProcess.length} pages: ${pagesToProcess.join(', ')}`);
+
+    // Convert pages to images in parallel with lower resolution for speed
+    const imagePromises = pagesToProcess.map(async (pageNum) => {
       const page = await pdf.getPage(pageNum);
-      const viewport = page.getViewport({ scale: 2.0 });
+      const viewport = page.getViewport({ scale: 1.5 }); // Reduced from 2.0 for 44% faster processing
 
-      // Create canvas
       const canvas = createCanvas(viewport.width, viewport.height);
       const context = canvas.getContext('2d');
 
-      // Render PDF page to canvas
       await page.render({
         canvasContext: context as any,
         viewport: viewport,
       }).promise;
 
-      // Convert to base64
       const imageBuffer = canvas.toBuffer('image/png');
       const base64Image = imageBuffer.toString('base64');
-      imagePromises.push({
+
+      return {
         type: 'image_url' as const,
         image_url: {
           url: `data:image/png;base64,${base64Image}`,
+          detail: 'high' as const
         },
-      });
-    }
+      };
+    });
 
-    console.log(`Converted ${imagePromises.length} pages to images, sending to GPT-4o...`);
+    const images = await Promise.all(imagePromises);
+    console.log(`Converted ${images.length} pages to images, sending to GPT-4o...`);
 
     // Use GPT-4o Vision to extract text
     const response = await openaiClient.chat.completions.create({
@@ -65,9 +124,9 @@ async function extractPDFTextWithVision(buffer: Buffer, openaiClient: OpenAI): P
           content: [
             {
               type: 'text',
-              text: 'Extract ALL the text from these document pages. Return ONLY the raw text content, maintaining the original structure.',
+              text: 'Extract ALL the text from these clinical trial document pages, focusing on inclusion and exclusion criteria sections. Return ONLY the raw text content, maintaining the original structure.',
             },
-            ...imagePromises,
+            ...images,
           ],
         },
       ],
@@ -75,7 +134,7 @@ async function extractPDFTextWithVision(buffer: Buffer, openaiClient: OpenAI): P
     });
 
     const extractedText = response.choices[0].message.content || '';
-    console.log(`GPT-4o Vision extracted ${extractedText.length} characters`);
+    console.log(`GPT-4o Vision extracted ${extractedText.length} characters from ${images.length} pages`);
 
     return extractedText;
   } catch (error) {
